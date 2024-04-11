@@ -35,7 +35,8 @@ def clean(origfn=None, tol=1e-10):
 
                 i, ix = 0, amix[0]
                 for j, jx in enumerate(amix[1:], start=1):
-                    if amfl[jx] - amfl[ix] >= tol:
+                    if not np.isclose(amfl[jx], amfl[ix], rtol=tol,
+                                      atol=0.1*tol):
                         if j - i > 1:
                             amfl[amix[i:j]] = np.median(amfl[amix[i:j]])
                         i, ix = j, jx
@@ -98,6 +99,11 @@ def fuzzysort(arr, idx, dim=0, tol=1e-6):
             srtdidx[i:] = fuzzysort(arr, srtdidx[i:], dim + 1, tol)
 
     return srtdidx
+
+
+def iter_struct(arr, n=1000, axis=0):
+    for c in np.array_split(arr, -(arr.shape[axis] // -n) or 1, axis=axis):
+        yield from c.tolist()
 
 
 _ctype_map = {

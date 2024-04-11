@@ -1,9 +1,23 @@
-from functools import cached_property
+from functools import cached_property, wraps
 
 import numpy as np
 
 from pyfr.nputil import npeval, fuzzysort
 from pyfr.util import memoize
+
+
+def inters_map(meth):
+    @wraps(meth)
+    def newmeth(self, eidx, fidx):
+        nfp = self.nfacefpts[fidx]
+        cmap = (eidx,)*nfp
+
+        match meth(self, eidx, fidx):
+            case [mid, rmap]:
+                return (mid,)*nfp, rmap, cmap
+            case [mid, rmap, lda]:
+                return (mid,)*nfp, rmap, cmap, (lda,)*nfp
+    return newmeth
 
 
 class BaseElements:
@@ -39,9 +53,8 @@ class BaseElements:
         # If we need quadrature points or not
         haveqpts = 'flux' in self.antialias
 
-        # If we are doing gradient fusion
-        self.grad_fusion = (cfg.getbool('solver', 'grad-fusion', True) and
-                            not haveqpts)
+        # Always do gradient fusion if flux anti-aliasing is off
+        self.grad_fusion = not haveqpts
 
         # Sizes
         self.nupts = basis.nupts
@@ -49,6 +62,13 @@ class BaseElements:
         self.nfpts = basis.nfpts
         self.nfacefpts = basis.nfacefpts
         self.nmpts = basis.nmpts
+
+        if self.basis.fpts_in_upts:
+            self.get_vect_fpts_for_inter = self._get_vect_upts_for_inter
+            self.get_comm_fpts_for_inter = self._get_comm_fpts_for_inter
+        else:
+            self.get_vect_fpts_for_inter = self._get_vect_fpts_for_inter
+            self.get_comm_fpts_for_inter = self._get_vect_fpts_for_inter
 
     @staticmethod
     def validate_formulation(form, intg, cfg):
@@ -155,6 +175,14 @@ class BaseElements:
         else:
             raise ValueError('Invalid slice region')
 
+    def _make_sliced_kernel(self, kseq):
+        klist = list(kseq)
+
+        if len(klist) > 1:
+            return self._be.unordered_meta_kernel(klist, [self._linoff])
+        else:
+            return klist[0]
+
     def set_backend(self, backend, nscalupts, nonce, linoff):
         self._be = backend
 
@@ -189,9 +217,15 @@ class BaseElements:
         if 'vect_fpts' in sbufs:
             self._vect_fpts = valloc('vect_fpts', nfpts)
 
+        # Allocate space if needed for interfaces
+        if 'comm_fpts' in sbufs:
+            self._comm_fpts = salloc('comm_fpts', nfpts)
+        elif 'vect_fpts' in sbufs:
+            self._comm_fpts = self._vect_fpts.slice(0, self.nfpts)
+
         if 'grad_upts' in sbufs and self.grad_fusion:
             self._grad_upts = valloc('grad_upts', nupts)
-        else:
+        elif self.grad_fusion:
             self._grad_upts = self._vect_upts
 
         # Allocate the storage required by the time integrator
@@ -375,22 +409,24 @@ class BaseElements:
         fpts_idx = self._srtd_face_fpts[fidx][eidx]
         return self._pnorm_fpts[fpts_idx, eidx]
 
+    @inters_map
     def get_scal_fpts_for_inter(self, eidx, fidx):
-        nfp = self.nfacefpts[fidx]
+        return self._scal_fpts.mid, self._srtd_face_fpts[fidx][eidx]
 
+    @inters_map
+    def _get_vect_fpts_for_inter(self, eidx, fidx):
         rmap = self._srtd_face_fpts[fidx][eidx]
-        cmap = (eidx,)*nfp
+        return self._vect_fpts.mid, rmap, self.nfpts
 
-        return (self._scal_fpts.mid,)*nfp, rmap, cmap
-
-    def get_vect_fpts_for_inter(self, eidx, fidx):
-        nfp = self.nfacefpts[fidx]
-
+    @inters_map
+    def _get_vect_upts_for_inter(self, eidx, fidx):
         rmap = self._srtd_face_fpts[fidx][eidx]
-        cmap = (eidx,)*nfp
-        rstri = (self.nfpts,)*nfp
+        fmap = self.basis.fpts_map_upts[rmap]
+        return self._vect_upts.mid, fmap, self.nupts
 
-        return (self._vect_fpts.mid,)*nfp, rmap, cmap, rstri
+    @inters_map
+    def _get_comm_fpts_for_inter(self, eidx, fidx):
+        return self._comm_fpts.mid, self._srtd_face_fpts[fidx][eidx]
 
     def get_ploc_for_inter(self, eidx, fidx):
         fpts_idx = self._srtd_face_fpts[fidx][eidx]
