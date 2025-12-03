@@ -1,7 +1,8 @@
+import numpy as np
+
 from pyfr.backends.base import NullKernel
 from pyfr.solvers.base import BaseElements
 
-import numpy as np
 
 class BaseAdvectionElements(BaseElements):
     def __init__(self, *kargs, **kwargs):
@@ -158,17 +159,26 @@ class BaseAdvectionElements(BaseElements):
                                               initval=entmin_int)
 
             # Setup nodal/modal operator matrices
-            self.invvdm = self._be.const_matrix(self.basis.ubasis.invvdm.T)
+            form = self.cfg.get('solver-entropy-filter', 'formulation',
+                                'nonlinear')
+            if form == 'linearised':
+                self.invvdm = self.vdm_ef = None
+            elif form == 'nonlinear':
+                self.invvdm = self._be.const_matrix(self.basis.ubasis.invvdm.T)
+                vdm_ef = self.basis.ubasis.vdm.T
+
+                if not self.basis.fpts_in_upts:
+                    vdmf = self.basis.ubasis.vdm_at(self.basis.fpts).T
+                    vdm_ef = np.vstack([vdm_ef, vdmf])
+
+                self.vdm_ef = self._be.const_matrix(vdm_ef)
+            else:
+                raise ValueError('Invalid entropy filter formulation.')
+
             if self.basis.fpts_in_upts:
-                self.vdm_ef = self._be.const_matrix(self.basis.ubasis.vdm.T)
                 self.m0 = None
             else:
-                vdmu = self.basis.ubasis.vdm.T
-                vdmf = self.basis.ubasis.vdm_at(self.basis.fpts).T
-                self.vdm_ef = self._be.const_matrix(np.vstack((vdmu, vdmf)))
                 self.m0 = self._be.const_matrix(self.basis.m0)
-        else:
-            self.entmin_int = None
 
     def get_entmin_int_fpts_for_inter(self, eidx, fidx):
         return (self.entmin_int.mid,), (fidx,), (eidx,)

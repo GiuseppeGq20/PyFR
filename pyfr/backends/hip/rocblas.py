@@ -1,5 +1,6 @@
 from ctypes import (POINTER, byref, c_int, c_double, c_float, c_uint32,
                     c_void_p)
+import os
 
 import numpy as np
 
@@ -57,6 +58,11 @@ class HIPRocBLASKernels(HIPKernelProvider):
     def __init__(self, backend):
         super().__init__(backend)
 
+        self._cstream = backend.hip.create_stream()
+
+        # Ensure memory can be allocated in captured streams
+        os.environ['ROCBLAS_STREAM_ORDER_ALLOC'] = '1'
+
         # Load and wrap rocBLAS
         self._wrappers = RocBLASWrappers()
 
@@ -73,12 +79,14 @@ class HIPRocBLASKernels(HIPKernelProvider):
     def __del__(self):
         try:
             if self._handle:
+                self._wrappers.rocblas_set_stream(self._handle, self._cstream)
                 self._wrappers.rocblas_destroy_handle(self._handle)
         except AttributeError:
             pass
 
     def mul(self, a, b, out, alpha=1.0, beta=0.0):
         h, w = self._handle, self._wrappers
+        cstream = self._cstream
 
         # Ensure the matrices are compatible
         if a.nrow != out.nrow or a.ncol != b.nrow or b.ncol != out.ncol:
@@ -120,6 +128,8 @@ class HIPRocBLASKernels(HIPKernelProvider):
         try:
             algo, dt = self._mul_cache[ckey]
         except KeyError:
+            ifac = self.backend.autotune_ifac
+
             def get_solutions(sidx):
                 size_ct = c_int(len(sidx) if sidx is not None else 0)
                 w.rocblas_gemm_ex_get_solutions(
@@ -138,21 +148,36 @@ class HIPRocBLASKernels(HIPKernelProvider):
             out_np = getattr(out, 'parent', out).get()
 
             best_kern = None
+
             # Benchmark suggested algorithms
             for algo in sidx:
-                dt = self._benchmark(gemm)
-                if best_kern is None or dt < best_kern[-1]:
-                    best_kern = algo, dt
-
+                try:
+                    dt = self._benchmark(gemm)
+                    if best_kern is None or dt < ifac*best_kern[-1]:
+                        best_kern = algo, dt
+                # In the case of invalid values raised by rocblas
+                except RocBLASInvalidValue:
+                    pass
+            
             # Restore the output matrix
             getattr(out, 'parent', out).set(out_np)
+            
+            # If all tests fail
+            if best_kern is None:
+                raise RuntimeError('Unable to obtain a kernel')
 
             # Update the cache
             self._mul_cache[ckey] = algo, dt = best_kern
 
         class MulKernel(HIPKernel):
             def add_to_graph(self, graph, deps):
-                pass
+                # Capture the execution of rocBLAS to obtain a graph
+                cstream.begin_capture()
+                self.run(cstream)
+                gnode = cstream.end_capture()
+
+                # Embed this graph in our main graph
+                return graph.graph.add_graph(gnode, deps)
 
             def run(self, stream):
                 gemm(stream)

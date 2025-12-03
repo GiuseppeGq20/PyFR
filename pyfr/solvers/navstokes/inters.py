@@ -4,7 +4,8 @@ from pyfr.solvers.baseadvecdiff import (BaseAdvectionDiffusionBCInters,
                                         BaseAdvectionDiffusionIntInters,
                                         BaseAdvectionDiffusionMPIInters)
 from pyfr.solvers.euler.inters import (FluidIntIntersMixin,
-                                       FluidMPIIntersMixin)
+                                       FluidMPIIntersMixin,
+                                       MassFlowBCMixin)
 
 
 class TplargsMixin:
@@ -102,8 +103,6 @@ class NavierStokesBaseBCInters(TplargsMixin, BaseAdvectionDiffusionBCInters):
             self._be.pointwise.register(
                 'pyfr.solvers.navstokes.kernels.bccent'
             )
-            self._tplargs['e_func'] = self.cfg.get('solver-entropy-filter',
-                                                   'e-func', 'numerical')
 
             self.kernels['comm_entropy'] = lambda: self._be.kernel(
                 'bccent', tplargs=self._tplargs, dims=[self.ninterfpts],
@@ -114,10 +113,10 @@ class NavierStokesBaseBCInters(TplargsMixin, BaseAdvectionDiffusionBCInters):
 
 class NavierStokesNoSlpIsotWallBCInters(NavierStokesBaseBCInters):
     type = 'no-slp-isot-wall'
-    cflux_state = 'ghost'
+    cflux_state = 'ghost-imperm'
 
-    def __init__(self, be, lhs, elemap, cfgsect, cfg):
-        super().__init__(be, lhs, elemap, cfgsect, cfg)
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
 
         self.c['cpTw'], = self._eval_opts(['cpTw'])
         self.c |= self._exp_opts('uvw'[:self.ndims], lhs,
@@ -126,7 +125,7 @@ class NavierStokesNoSlpIsotWallBCInters(NavierStokesBaseBCInters):
 
 class NavierStokesNoSlpAdiaWallBCInters(NavierStokesBaseBCInters):
     type = 'no-slp-adia-wall'
-    cflux_state = 'ghost'
+    cflux_state = 'ghost-imperm'
 
 
 class NavierStokesSlpAdiaWallBCInters(NavierStokesBaseBCInters):
@@ -138,8 +137,8 @@ class NavierStokesCharRiemInvBCInters(NavierStokesBaseBCInters):
     type = 'char-riem-inv'
     cflux_state = 'ghost'
 
-    def __init__(self, be, lhs, elemap, cfgsect, cfg):
-        super().__init__(be, lhs, elemap, cfgsect, cfg)
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
 
         self.c |= self._exp_opts(
             ['rho', 'p', 'u', 'v', 'w'][:self.ndims + 2], lhs
@@ -150,8 +149,8 @@ class NavierStokesSupInflowBCInters(NavierStokesBaseBCInters):
     type = 'sup-in-fa'
     cflux_state = 'ghost'
 
-    def __init__(self, be, lhs, elemap, cfgsect, cfg):
-        super().__init__(be, lhs, elemap, cfgsect, cfg)
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
 
         self.c |= self._exp_opts(
             ['rho', 'p', 'u', 'v', 'w'][:self.ndims + 2], lhs
@@ -167,8 +166,8 @@ class NavierStokesSubInflowFrvBCInters(NavierStokesBaseBCInters):
     type = 'sub-in-frv'
     cflux_state = 'ghost'
 
-    def __init__(self, be, lhs, elemap, cfgsect, cfg):
-        super().__init__(be, lhs, elemap, cfgsect, cfg)
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
 
         self.c |= self._exp_opts(
             ['rho', 'u', 'v', 'w'][:self.ndims + 1], lhs,
@@ -207,7 +206,13 @@ class NavierStokesSubOutflowBCInters(NavierStokesBaseBCInters):
     type = 'sub-out-fp'
     cflux_state = 'ghost'
 
-    def __init__(self, be, lhs, elemap, cfgsect, cfg):
-        super().__init__(be, lhs, elemap, cfgsect, cfg)
+    def __init__(self, be, lhs, elemap, cfgsect, cfg, bccomm):
+        super().__init__(be, lhs, elemap, cfgsect, cfg, bccomm)
 
         self.c |= self._exp_opts(['p'], lhs)
+
+
+class NavierStokesCharRiemInvMassFlowBCInters(MassFlowBCMixin, 
+                                              NavierStokesBaseBCInters):
+    type = 'char-riem-inv-mass-flow'
+    cflux_state = 'ghost'

@@ -1,14 +1,14 @@
 from itertools import zip_longest
 
+from pyfr.cache import memoize
 from pyfr.solvers.base import BaseSystem
-from pyfr.util import memoize
 
 
 class BaseAdvectionSystem(BaseSystem):
     @memoize
     def _rhs_graphs(self, uinbank, foutbank):
         m = self._mpireqs
-        k, _ = self._get_kernels(uinbank, foutbank)
+        k, *_ = self._get_kernels(uinbank, foutbank)
 
         def deps(dk, *names): return self._kdeps(k, dk, *names)
 
@@ -47,28 +47,20 @@ class BaseAdvectionSystem(BaseSystem):
         # Make a copy of the solution (if used by source terms)
         g1.add_all(k['eles/copy_soln'], deps=k['eles/entropy_filter'])
 
-        # Interpolate the solution to the quadrature points
-        g1.add_all(k['eles/qptsu'], deps=k['eles/entropy_filter'])
-
-        # Compute the transformed flux
-        for l in k['eles/tdisf']:
-            ldeps = deps(l, 'eles/qptsu')
-            g1.add(l, deps=ldeps + k['eles/entropy_filter'])
-
-        # Compute the transformed divergence of the partially corrected flux
-        for l in k['eles/tdivtpcorf']:
-            ldeps = deps(l, 'eles/tdisf', 'eles/copy_soln', 'eles/disu')
-            g1.add(l, deps=ldeps + k['mpiint/scal_fpts_pack'])
-
-        # Group tdisf, qptsu, and tdivtpcorf kernels
-        kgroup = [k['eles/qptsu'], k['eles/tdisf'], k['eles/tdivtpcorf']]
-        for k1, k2, k3 in zip_longest(*kgroup):
-            self._group(g1, [k1, k2, k3], subs=[[(k1, 'out'), (k2, 'u')],
-                                                [(k2, 'f'), (k3, 'b')]])
-
         g1.commit()
 
         g2 = self.backend.graph()
+
+        # Interpolate the solution to the quadrature points
+        g2.add_all(k['eles/qptsu'])
+
+        # Compute the transformed flux
+        for l in k['eles/tdisf']:
+            g2.add(l, deps=deps(l, 'eles/qptsu'))
+
+        # Compute the transformed divergence of the partially corrected flux
+        for l in k['eles/tdivtpcorf']:
+            g2.add(l, deps=deps(l, 'eles/tdisf'))
 
         # Compute the common normal flux at our MPI interfaces
         g2.add_all(k['mpiint/scal_fpts_unpack'])
@@ -81,15 +73,21 @@ class BaseAdvectionSystem(BaseSystem):
             g2.add(l, deps=deps(l, 'mpiint/ent_fpts_unpack'))
 
         # Compute the transformed divergence of the corrected flux
-        g2.add_all(k['eles/tdivtconf'], deps=k['mpiint/comm_flux'])
+        for l in k['eles/tdivtconf']:
+            ldeps = deps(l, 'eles/tdivtpcorf') + k['mpiint/comm_flux']
+            g2.add(l, deps=ldeps)
 
         # Obtain the physical divergence of the corrected flux
         for l in k['eles/negdivconf']:
             g2.add(l, deps=deps(l, 'eles/tdivtconf'))
 
-        # Group tdivtconf and negdivconf kernels
-        for k1, k2 in zip_longest(k['eles/tdivtconf'], k['eles/negdivconf']):
-            self._group(g2, [k1, k2])
+        kgroup = [k['eles/qptsu'], k['eles/tdisf'], k['eles/tdivtpcorf'],
+                  k['eles/tdivtconf'], k['eles/negdivconf']]
+        for ks in zip_longest(*kgroup):
+            self._group(g2, ks, subs=[
+                [(ks[0], 'out'), (ks[1], 'u')],
+                [(ks[1], 'f'), (ks[2], 'b')],
+            ])
 
         g2.commit()
 
@@ -98,7 +96,11 @@ class BaseAdvectionSystem(BaseSystem):
     @memoize
     def _preproc_graphs(self, uinbank):
         m = self._mpireqs
-        k, _ = self._get_kernels(uinbank, None)
+        k, *_ = self._get_kernels(uinbank, None)
+
+        # Short-circuit if entropy filtering is disabled
+        if 'eles/entropy_filter' not in k:
+            return ()
 
         def deps(dk, *names): return self._kdeps(k, dk, *names)
 
@@ -139,6 +141,6 @@ class BaseAdvectionSystem(BaseSystem):
             return g1,
 
     def postproc(self, uinbank):
-        k, _ = self._get_kernels(uinbank, None)
+        k, *_ = self._get_kernels(uinbank, None)
 
         self.backend.run_kernels(k['eles/entropy_filter'])
