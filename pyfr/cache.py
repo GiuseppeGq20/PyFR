@@ -44,9 +44,16 @@ def memoize(origfn=None, maxsize=None):
             res = cache[key] = meth(self, *args, **kwargs)
             return res
 
+        newmeth.clear = lambda self: vars(self).pop(cattr, None)
         return newmeth
 
     return memoizefn(origfn) if origfn else memoizefn
+
+
+def clear_memoize(obj):
+    for k in list(vars(obj)):
+        if k.startswith('_memoize_cache@'):
+            delattr(obj, k)
 
 
 class ObjectCache:
@@ -73,7 +80,7 @@ class ObjectCache:
     def get_bytes(self, k):
         try:
             return self.get_path(k).read_bytes()
-        except (AttributeError, IOError):
+        except (AttributeError, OSError):
             return None
 
     def set_with_bytes(self, k, bytes):
@@ -99,9 +106,15 @@ class ObjectCache:
         return None
 
     def _prune_cache(self, maxsize):
-        files = {f: f.stat() for f in self.cachedir.iterdir() if f.is_file()}
-        csize = sum(fs.st_size for fs in files.values())
+        files = {}
+        for f in self.cachedir.iterdir():
+            try:
+                if f.is_file():
+                    files[f] = f.stat()
+            except FileNotFoundError:
+                pass
 
+        csize = sum(fs.st_size for fs in files.values())
         if csize > maxsize:
             for f, fs in sorted(files.items(), key=lambda f: f[1].st_atime):
                 f.unlink(missing_ok=True)

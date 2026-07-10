@@ -3,20 +3,18 @@ from collections import defaultdict
 import numpy as np
 
 from pyfr.cache import memoize
-from pyfr.shapes import BaseShape
+from pyfr.nputil import search_unsorted
+from pyfr.polys import get_polybasis
+from pyfr.shapes import BaseShape, proj_pts
 from pyfr.util import subclass_where
 from pyfr.writers.vtk.base import BaseVTKWriter, interpolate_pts
-
-
-def _search(a, v):
-    idx = np.argsort(a)
-    return idx[np.searchsorted(a, v, sorter=idx)]
+from pyfr.writers.vtk.shapes import get_vtk_shape
 
 
 class VTKBoundaryWriter(BaseVTKWriter):
     type = 'boundary'
+    dimensions = '2|3'
     output_curved = True
-    output_partition = True
 
     def __init__(self, meshf, boundaries, **kwargs):
         super().__init__(meshf, **kwargs)
@@ -54,39 +52,60 @@ class VTKBoundaryWriter(BaseVTKWriter):
                     raise ValueError('Output boundaries not present in subset '
                                      'solution')
 
-                eoff = _search(smesh.eidxs[etype], eidxs[eoff])
+                eoff = search_unsorted(smesh.eidxs[etype], eidxs[eoff])
 
             # Obtain the associated surface info
             for stype, *info in self._get_surface_info(etype, eoff, fidx):
                 ecount[stype] += len(info[-1])
-                self._surface_info[stype].append((etype, *info))
+                self._surface_info[stype].append(info)
 
         self.einfo = list(ecount.items())
-
-    @memoize
-    def _get_shape(self, etype, cfg):
-        nspts = len(self.mesh.spts[etype])
-        return subclass_where(BaseShape, name=etype)(nspts, cfg)
 
     @memoize
     def _itype_opmats(self, etype, fidx, cfg):
         shape = self._get_shape(etype, cfg)
 
         # Get the information about our face
-        itype, proj, norm = shape.faces[fidx]
-        ishapecls = subclass_where(BaseShape, name=itype)
+        itype, proj, _ = shape.faces[fidx]
 
         # Obtain the visualisation points on this face
-        svpts = np.array(ishapecls.std_ele(self.etypes_div[itype]))
-        svpts = np.vstack(np.broadcast_arrays(*proj(*svpts.T))).T
-
-        if self.ho_output:
-            svpts = svpts[self._nodemaps[itype, len(svpts)]]
+        svpts = proj_pts(proj, self._svpts(itype))
 
         mesh_op = shape.sbasis.nodal_basis_at(svpts)
         soln_op = shape.ubasis.nodal_basis_at(svpts)
 
-        return itype, mesh_op, soln_op
+        # Linear basis for P1 vertex data
+        linspts = subclass_where(BaseShape, name=etype).std_ele(1)
+        lbasis = get_polybasis(etype, 1, linspts)
+        lin_op = lbasis.nodal_basis_at(svpts)
+
+        return itype, mesh_op, soln_op, lin_op, etype, fidx, svpts
+
+    @memoize
+    def _svpts(self, itype):
+        ishapecls = subclass_where(BaseShape, name=itype)
+        svpts = ishapecls.std_ele(self.etypes_div[itype])
+        if self.ho_output:
+            vshape = get_vtk_shape(itype, self.etypes_div[itype])
+            svpts = svpts[vshape.nodemaps[len(svpts)]]
+        return svpts
+
+    def _output_topology(self):
+        svpts = {itype: self._svpts(itype) for itype in self._surface_info}
+
+        cnodes = {}
+        for itype, groups in self._surface_info.items():
+            pieces = []
+            for *_, etype, fidx, _, idxs in groups:
+                shapecls = subclass_where(BaseShape, name=etype)
+                spts_nodes = self.mesh.spts_nodes[etype]
+                cidxs = shapecls.face_corner_pts_idxs(fidx,
+                                                      spts_nodes.shape[1])
+                pieces.append(spts_nodes[np.ix_(idxs, cidxs)])
+
+            cnodes[itype] = np.concatenate(pieces)
+
+        return cnodes, svpts
 
     def _get_surface_info(self, etype, eoffs, fidxs):
         info, idxs = {}, defaultdict(list)
@@ -99,21 +118,62 @@ class VTKBoundaryWriter(BaseVTKWriter):
 
         return [(*info[f], idxs[f]) for f in info]
 
-    def _prepare_pts(self, itype):
-        vspts, vsoln, curved, part = [], [], [], []
+    def _itype_point_shapes(self, itype):
+        shapes = set()
+        for *_, etype, _, _, _ in self._surface_info[itype]:
+            shapes.update(self._extra_point_shapes(etype))
+        return shapes
 
-        for etype, mesh_op, soln_op, idxs in self._surface_info[itype]:
+    def _prepare_pts(self, itype):
+        vspts, vsoln, curved = [], [], []
+        cellf, pointf = defaultdict(list), defaultdict(list)
+
+        pshapes = self._itype_point_shapes(itype)
+        for *ops, etype, fidx, svpts, idxs in self._surface_info[itype]:
+            mesh_op, soln_op, lin_op = ops
             spts = self.mesh.spts[etype][:, idxs]
-            soln = self.soln[etype][..., idxs]
+            soln = self.soln.data[etype][..., idxs]
             soln = soln.swapaxes(0, 1).astype(self.dtype)
 
             # Pre-process the solution
             soln = self._pre_proc_fields(soln).swapaxes(0, 1)
 
-            vspts.append(interpolate_pts(mesh_op, spts))
-            vsoln.append(interpolate_pts(soln_op, soln))
-            curved.append(self.mesh.spts_curved[etype][idxs])
-            part.append(self.soln[f'{etype}-parts'][idxs])
+            face_vpts = interpolate_pts(mesh_op, spts)
+            face_vsoln = interpolate_pts(soln_op, soln)
 
-        return (np.hstack(vspts), np.dstack(vsoln),
-                np.hstack(curved), np.hstack(part))
+            vspts.append(face_vpts)
+            vsoln.append(face_vsoln)
+            curved.append(self.mesh.spts_curved[etype][idxs])
+
+            # Extract aux fields
+            nupts = soln.shape[0]
+            for fname, arr in self.soln.aux.get(etype, {}).items():
+                data = arr[idxs]
+                shape = data.shape[1:]
+
+                if shape in pshapes:
+                    pshape = shape
+                elif shape[:-1] in pshapes:
+                    pshape = shape[:-1]
+                else:
+                    cellf[fname].append(data)
+                    continue
+
+                op = soln_op if pshape == (nupts,) else lin_op
+                pointf[fname].append(
+                    interpolate_pts(op, np.moveaxis(data, 0, 1))
+                )
+
+            samples = face_vsoln.transpose(1, 0, 2)
+            bdy = (spts, etype, fidx, svpts)
+            got = self.pp_runner.run_samples(self.soln.config, samples,
+                                             boundary=bdy)
+            for fname, arr in got.items():
+                pointf[fname].append(arr)
+
+        # Concatenate extra fields
+        cellf = {k: np.hstack(v) for k, v in cellf.items()}
+        pointf = {k: np.hstack(v) for k, v in pointf.items()}
+
+        return (np.hstack(vspts), np.dstack(vsoln), np.hstack(curved), cellf,
+                pointf)
